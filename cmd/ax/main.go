@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
@@ -210,6 +211,7 @@ Available Commands:
   describe model <name>   Show detailed information about a model
   watch task <name>       Stream live status and condition updates for a task
   ssh <task-name> [-- cmd] Run a command or shell inside the running task container
+                          (Ctrl-C is forwarded; press it twice quickly, or Ctrl-\, to exit locally)
   suspend task <name>     Suspend execution of a task and checkpoint state
   resume task <name>      Resume execution of a suspended task
   delete task <name>      Delete a task
@@ -1115,10 +1117,29 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 	}
 	defer guestClient.Close()
 
+	// A bare shell on a terminal runs with -i, so it prompts and Ctrl-C stops the
+	// command it is running rather than the shell itself.
+	if stdinIsTerminal() && len(cmdToRun) == 1 && cmdToRun[0] == "/bin/sh" {
+		cmdToRun = []string{"/bin/sh", "-i"}
+	}
+
+	// Ctrl-C is passed on to the remote command instead of ending ax ssh. Pressing
+	// it twice in quick succession gives up on the session and exits locally, so
+	// a hung connection never traps the terminal.
+	rawSigs := make(chan os.Signal, 4)
+	signal.Notify(rawSigs, os.Interrupt)
+	defer signal.Stop(rawSigs)
+	sigs := escalateInterrupts(rawSigs, interruptExitWindow, func() {
+		fmt.Fprintln(os.Stderr, "\nax ssh: interrupted twice, exiting")
+		os.Exit(130)
+	})
+
 	exitCode, err := guestClient.Exec(context.Background(), guest.ExecOptions{
 		Command: cmdToRun,
+		Stdin:   os.Stdin,
 		Stdout:  os.Stdout,
 		Stderr:  os.Stderr,
+		Signals: sigs,
 	})
 	if err != nil {
 		return err
@@ -1129,4 +1150,39 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 	}
 
 	return nil
+}
+
+// interruptExitWindow is how soon a second Ctrl-C must follow the first to end
+// ax ssh locally instead of being forwarded to the remote command.
+const interruptExitWindow = time.Second
+
+// escalateInterrupts relays each signal from in to the returned channel, except
+// that a signal arriving within window of the previous one calls exit instead.
+// This keeps a single Ctrl-C going to the remote command while a repeated one
+// still works as an escape hatch.
+func escalateInterrupts(in <-chan os.Signal, window time.Duration, exit func()) <-chan os.Signal {
+	out := make(chan os.Signal, 1)
+	go func() {
+		var last time.Time
+		for sig := range in {
+			now := time.Now()
+			if !last.IsZero() && now.Sub(last) < window {
+				exit()
+				return
+			}
+			last = now
+			select {
+			case out <- sig:
+			default:
+			}
+		}
+	}()
+	return out
+}
+
+// stdinIsTerminal reports whether standard input is a terminal rather than a
+// pipe or file.
+func stdinIsTerminal() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
